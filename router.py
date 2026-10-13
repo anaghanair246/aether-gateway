@@ -3,12 +3,15 @@ import numpy as np
 import onnxruntime as ort
 from transformers import AutoTokenizer
 
+def softmax(x):
+    """Converts raw logits into percentages/probabilities (0.0 to 1.0)"""
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum(axis=-1, keepdims=True)
+
 class ComplexityRouter:
     def __init__(self, model_path="models/complexity_classifier.onnx"):
-        # Initialize the tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-xsmall")
-        
-        # Attempt to load the ONNX model
+        # Swapped to DistilBERT to match our stable ONNX model
+        self.tokenizer = AutoTokenizer.from_pretrained("distilbert/distilbert-base-uncased")
         try:
             self.session = ort.InferenceSession(model_path)
             self.mode = "onnx_ml"
@@ -21,33 +24,43 @@ class ComplexityRouter:
         start_time = time.perf_counter()
         
         if self.mode == "onnx_ml":
-            # 1. Tokenize the input prompt
-            inputs = self.tokenizer(prompt, return_tensors="np", truncation=True, max_length=128)
+            inputs = self.tokenizer(
+                prompt, 
+                return_tensors="np", 
+                truncation=True, 
+                padding="max_length", 
+                max_length=128
+            )
             
-            # 2. Map to ONNX expected inputs
             onnx_inputs = {
                 "input_ids": inputs["input_ids"],
                 "attention_mask": inputs["attention_mask"]
             }
             
-            # 3. Run sub-15ms inference
             outputs = self.session.run(None, onnx_inputs)
-            logits = outputs[0]
+            raw_logits = outputs[0][0]
             
-            # 4. Classify (Assuming 0 = cheap, 1 = strong)
-            prediction = np.argmax(logits, axis=1)[0]
-            selected_tier = "strong" if prediction == 1 else "cheap"
+            # Thesis Metrics: Calculate confidence probabilities
+            probs = softmax(raw_logits)
+            confidence = float(np.max(probs))
+            predicted_class = int(np.argmax(probs))
+            
+            selected_tier = "strong" if predicted_class == 1 else "cheap"
+            logits_list = [round(float(x), 4) for x in raw_logits]
             
         else:
-            # Baseline Heuristic
             complex_keywords = ["analyze", "code", "evaluate", "synthesize", "algorithm", "compare"]
             is_complex = len(prompt.split()) > 40 or any(kw in prompt.lower() for kw in complex_keywords)
             selected_tier = "strong" if is_complex else "cheap"
+            confidence = 1.0
+            logits_list = []
 
         latency = round((time.perf_counter() - start_time) * 1000, 2)
         
         return {
             "routed_tier": selected_tier,
+            "confidence": round(confidence, 4),
+            "logits": logits_list,
             "router_latency_ms": latency,
             "routing_mode": self.mode
         }
