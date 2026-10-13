@@ -15,6 +15,7 @@ class ChatRequest(BaseModel):
     message: str
     tier: str = "auto"
     session_id: str = None # Allow client to track conversations
+    skip_cache: bool = False # Added for pristine thesis benchmarking
 
 @app.on_event("startup")
 async def startup_event():
@@ -37,7 +38,10 @@ async def chat(request: ChatRequest):
     # 3. Semantic Caching Pipeline (Only cache stand-alone queries without history)
     history = await get_chat_history(session_id)
     
-    if not history: # Skip cache if in middle of a conversation
+    conn = None
+    vector_str = None
+    
+    if not history and not request.skip_cache: 
         query_vector = get_embedding(request.message)
         vector_str = f"[{','.join(map(str, query_vector))}]"
         
@@ -68,16 +72,5 @@ async def chat(request: ChatRequest):
     # 6. Save LLM response to state
     await add_to_history(session_id, "assistant", llm_result["response"])
     
-    # Optional: Cache the new standalone concept if it wasn't part of a conversation
-    if not history:
-        insert_query = "INSERT INTO semantic_cache (prompt, prompt_embedding, response) VALUES ($1, $2::vector, $3);"
-        await conn.execute(insert_query, request.message, vector_str, llm_result["response"])
-        await conn.close()
-    
-    return {
-        "session_id": session_id,
-        "response": llm_result["response"],
-        "source": "live_llm",
-        "router_telemetry": router_telemetry,
-        "llm_telemetry": llm_result
-    }
+    # 7. Cache the new standalone concept (Bypassed if skip_cache is True)
+    if not history and not request.skip_cache:
